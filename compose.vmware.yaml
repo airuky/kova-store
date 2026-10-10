@@ -1,0 +1,12 @@
+# Optional: expose only the VMware NAT host interface as a second binding.
+# Check the address on the host before using this file.
+services:
+  app:
+    environment:
+      ADDITIONAL_HOST: "${KOVA_VM_HOST_IP:-192.168.180.1}"
+
+  gateway:
+    environment:
+      ADDITIONAL_HOST: "${KOVA_VM_HOST_IP:-192.168.180.1}"
+    ports:
+      - "${KOVA_VM_HOST_IP:-192.168.180.1}:${KOVA_PORT:-4327}:8080"
