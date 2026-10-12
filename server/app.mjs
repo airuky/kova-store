@@ -1,14 +1,26 @@
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
 const sessionMaxAge = 12 * 60 * 60 * 1000;
 const maxJsonBytes = 32 * 1024;
+const loginWindowMs = 60 * 1000;
+const loginFailureLimit = 5;
+const accountCodeLifetimeMs = 10 * 60 * 1000;
+const rewardTokenLifetimeMs = 10 * 60 * 1000;
+const rewardOfferPoints = 500;
+const integrationTokenLifetimeMs = 15 * 60 * 1000;
+const returnCreditPoints = 250;
+const receiptLinkLifetimeMs = 15 * 60 * 1000;
+const receiptMaxAheadMs = 24 * 60 * 60 * 1000;
+const previewMaxBytes = 4096;
+const previewTimeoutMs = 1200;
 
 const products = [
   { id: 1, slug: 'arc-table-lamp', name: 'ARC テーブルライト', category: '照明', price: 12800, stock: 18, image: '/images/arc-table-lamp.png', description: '曲線のアルミシェードが、デスクにやわらかな光を広げるテーブルライト。3段階の調光に対応。', featured: 1, accent: '#b39880', visible: 1 },
@@ -44,6 +56,19 @@ function publicReview(row) {
   return { id: row.id, authorName: row.author_name, rating: row.rating, title: row.title, body: row.body, createdAt: row.created_at };
 }
 
+function publicReturnRequest(row) {
+  if (!row) return null;
+  return {
+    id: row.id, orderId: row.order_id, status: row.status,
+    creditPoints: row.credit_points, requestedAt: row.requested_at,
+  };
+}
+
+function csvCell(value) {
+  // CSV structure is escaped, but spreadsheet formulas remain active by design.
+  return `"${String(value ?? '').replaceAll('"', '""')}"`;
+}
+
 function passwordRecord(password) {
   const salt = randomBytes(16).toString('hex');
   const hash = scryptSync(password, salt, 64).toString('hex');
@@ -54,6 +79,23 @@ function passwordMatches(password, row) {
   const candidate = scryptSync(password, row.password_salt, 64);
   const actual = Buffer.from(row.password_hash, 'hex');
   return actual.length === candidate.length && timingSafeEqual(actual, candidate);
+}
+
+function tokenHash(token) {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+function isLoopback(address) {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+function trustedWidgetOrigin(origin, additionalHost) {
+  if (typeof origin !== 'string') return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:' && parsed.origin === origin &&
+      (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === additionalHost);
+  } catch { return false; }
 }
 
 function initDb(dataDir) {
@@ -84,7 +126,8 @@ function initDb(dataDir) {
       id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
       status TEXT NOT NULL, subtotal INTEGER NOT NULL, shipping_fee INTEGER NOT NULL,
       total INTEGER NOT NULL, created_at TEXT NOT NULL,
-      name TEXT NOT NULL, address TEXT NOT NULL, postal_code TEXT NOT NULL, method TEXT NOT NULL
+      name TEXT NOT NULL, address TEXT NOT NULL, postal_code TEXT NOT NULL, method TEXT NOT NULL,
+      stock_reserved INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS order_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL REFERENCES orders(id),
@@ -95,10 +138,57 @@ function initDb(dataDir) {
       product_id INTEGER NOT NULL REFERENCES products(id), rating INTEGER NOT NULL,
       title TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS password_codes (
+      code_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+      expires_at INTEGER NOT NULL, used_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS reward_balances (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id), points INTEGER NOT NULL DEFAULT 0,
+      campaign_redeemed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS reward_tokens (
+      token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+      points INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS app_secrets (
+      name TEXT PRIMARY KEY, value BLOB NOT NULL CHECK(length(value)=32)
+    );
+    CREATE TABLE IF NOT EXISTS api_tokens (
+      token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+      scope TEXT NOT NULL, expires_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS api_tokens_user_expiry ON api_tokens(user_id,expires_at);
+    CREATE TABLE IF NOT EXISTS return_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL UNIQUE REFERENCES orders(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      status TEXT NOT NULL, credit_points INTEGER NOT NULL,
+      requested_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS product_private (
+      product_id INTEGER PRIMARY KEY REFERENCES products(id),
+      supplier_cost INTEGER NOT NULL, internal_note TEXT NOT NULL
+    );
   `);
+  if (!db.prepare('PRAGMA table_info(orders)').all().some((column) => column.name === 'stock_reserved')) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec('ALTER TABLE orders ADD COLUMN stock_reserved INTEGER NOT NULL DEFAULT 0');
+      // Before this migration, only the two fixed demonstration orders bypassed checkout's stock decrement.
+      db.prepare(`UPDATE orders SET stock_reserved=1 WHERE NOT
+        ((id='K-2026-1001' AND created_at='2026-09-21T11:20:00.000Z') OR
+         (id='K-2026-1002' AND created_at='2026-10-02T09:35:00.000Z'))`).run();
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
   if (db.prepare('SELECT COUNT(*) AS n FROM products').get().n === 0) {
     const put = db.prepare('INSERT INTO products (id,slug,name,category,price,stock,image,description,featured,accent,visible) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
     for (const product of products) put.run(product.id, product.slug, product.name, product.category, product.price, product.stock, product.image, product.description, product.featured, product.accent, product.visible);
+  }
+  const putPrivate = db.prepare('INSERT OR IGNORE INTO product_private (product_id,supplier_cost,internal_note) VALUES (?,?,?)');
+  for (const product of products.filter((item) => item.visible)) {
+    putPrivate.run(product.id, Math.floor(product.price * 0.54),
+      product.id === 1 ? 'CANARY-KOVA-SUPPLY-ARC-27 / 社内仕入れメモ' : `${product.slug} / 社内仕入れメモ`);
   }
   if (db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 0) {
     const put = db.prepare('INSERT INTO users (name,email,password_salt,password_hash,role,address,bio,created_at) VALUES (?,?,?,?,?,?,?,?)');
@@ -202,11 +292,45 @@ function cartState(db, userId) {
   return { items, subtotal: items.reduce((sum, item) => sum + item.quantity * item.product.price, 0) };
 }
 
+function rewardSummary(db, userId) {
+  const row = db.prepare('SELECT points,campaign_redeemed FROM reward_balances WHERE user_id=?').get(userId);
+  return { points: row?.points ?? 0, campaignRedeemed: Boolean(row?.campaign_redeemed) };
+}
+
 function orderRecord(db, id) {
   const row = db.prepare('SELECT * FROM orders WHERE id=?').get(id);
   if (!row) return null;
   const items = db.prepare('SELECT product_id AS productId,name,quantity,price FROM order_items WHERE order_id=? ORDER BY id').all(id);
   return { id: row.id, status: row.status, subtotal: row.subtotal, shippingFee: row.shipping_fee, total: row.total, createdAt: row.created_at, name: row.name, address: row.address, postalCode: row.postal_code, method: row.method, items };
+}
+
+function returnRequestRecord(db, id) {
+  return publicReturnRequest(db.prepare('SELECT * FROM return_requests WHERE id=?').get(id));
+}
+
+function cancelOrder(db, id, { ownerId = null } = {}) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const row = ownerId === null
+      ? db.prepare('SELECT status,stock_reserved FROM orders WHERE id=?').get(id)
+      : db.prepare('SELECT status,stock_reserved FROM orders WHERE id=? AND user_id=?').get(id, ownerId);
+    if (!row) throw Object.assign(new Error('注文が見つかりません'), { status: 404 });
+    if (row.status !== 'processing') {
+      throw Object.assign(new Error('この注文はキャンセルできません'), { status: 409 });
+    }
+    const changed = db.prepare("UPDATE orders SET status='cancelled',stock_reserved=0 WHERE id=? AND status='processing'")
+      .run(id);
+    if (changed.changes !== 1) throw Object.assign(new Error('この注文はキャンセルできません'), { status: 409 });
+    if (row.stock_reserved === 1) {
+      const items = db.prepare('SELECT product_id,quantity FROM order_items WHERE order_id=?').all(id);
+      const restore = db.prepare('UPDATE products SET stock=stock+? WHERE id=?');
+      for (const item of items) {
+        if (restore.run(item.quantity, item.product_id).changes !== 1) throw new Error('在庫を更新できません');
+      }
+    }
+    db.exec('COMMIT');
+  } catch (error) { db.exec('ROLLBACK'); throw error; }
+  return orderRecord(db, id);
 }
 
 function serveStatic(res, pathname) {
@@ -228,9 +352,58 @@ function serveStatic(res, pathname) {
 export function createApplication({ dataDir = join(process.cwd(), 'data'), additionalHost = process.env.ADDITIONAL_HOST || '' } = {}) {
   if (additionalHost && !isIP(additionalHost)) throw new Error('additionalHost must be a literal IP address');
   const db = initDb(dataDir);
+  db.prepare('INSERT OR IGNORE INTO app_secrets (name,value) VALUES (?,?)').run('receipt_hmac_v1', randomBytes(32));
+  const storedReceiptKey = db.prepare('SELECT value FROM app_secrets WHERE name=?').get('receipt_hmac_v1')?.value;
+  if (!(storedReceiptKey instanceof Uint8Array) || storedReceiptKey.length !== 32) throw new Error('Receipt signing key is invalid');
+  const receiptSigningKey = Buffer.from(storedReceiptKey);
   const catalog = initCatalog(db);
   const sessions = new Map();
+  const failedLogins = new Map();
+  let loginChecks = 0;
+  let overviewCache = null;
   let closed = false;
+
+  function receiptSignature(id) {
+    // VULNERABLE: the expiry value is left out of the signed message.
+    return createHmac('sha256', receiptSigningKey).update(`receipt:${id}`).digest('hex');
+  }
+
+  function bearerPrincipal(req) {
+    const authorization = req.headers.authorization;
+    const match = typeof authorization === 'string' ? authorization.match(/^Bearer ([A-Za-z0-9_-]{43})$/i) : null;
+    if (!match) return null;
+    const row = db.prepare(`SELECT t.scope,t.expires_at,u.id,u.name,u.email,u.address
+      FROM api_tokens t JOIN users u ON u.id=t.user_id WHERE t.token_hash=?`).get(tokenHash(match[1]));
+    return row && row.expires_at > Date.now() ? row : null;
+  }
+
+  function loginKey(req, email) {
+    // Deliberately trusts a syntactically valid, user-supplied proxy header.
+    const header = typeof req.headers['x-real-ip'] === 'string' ? req.headers['x-real-ip'].trim() : '';
+    const ip = isIP(header) ? header : (req.socket.remoteAddress || 'unknown');
+    return `${email}\0${ip}`;
+  }
+
+  function recentLoginFailures(key, now) {
+    const recent = (failedLogins.get(key) || []).filter((time) => now - time < loginWindowMs);
+    if (recent.length) failedLogins.set(key, recent);
+    else failedLogins.delete(key);
+    if (++loginChecks % 64 === 0) {
+      for (const [otherKey, times] of failedLogins) {
+        const active = times.filter((time) => now - time < loginWindowMs);
+        if (active.length) failedLogins.set(otherKey, active);
+        else failedLogins.delete(otherKey);
+      }
+    }
+    return recent;
+  }
+
+  function recordLoginFailure(key, attempts, now) {
+    failedLogins.delete(key);
+    failedLogins.set(key, [...attempts, now]);
+    // Keep the per-process limiter bounded even when clients vary headers and emails.
+    while (failedLogins.size > 2048) failedLogins.delete(failedLogins.keys().next().value);
+  }
 
   const server = createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -243,6 +416,33 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
     try { url = new URL(req.url, `http://${req.headers.host}`); } catch { return fail(res, 400, '無効なURLです'); }
     const pathname = url.pathname;
     if (req.method === 'GET' && pathname === '/api/health') return json(res, 200, { status: 'ok', service: 'kova-store' });
+    if (req.method === 'GET' && pathname === '/_media/notes') {
+      return json(res, 200, { title: 'KOVA 編集ノート', summary: '新着商品と季節のおすすめを紹介します。' });
+    }
+    if (req.method === 'GET' && pathname === '/_internal/supplier-note') {
+      if (!isLoopback(req.socket.remoteAddress)) return fail(res, 403, 'この操作はできません');
+      return json(res, 200, { title: '仕入れ先向けメモ', summary: 'CANARY-KOVA-SUPPLIER-Q4-PRICING' });
+    }
+    const receiptMatch = pathname.match(/^\/api\/receipts\/(K-\d{4}-\d+)$/);
+    if (req.method === 'GET' && receiptMatch) {
+      const expiresText = url.searchParams.get('expires');
+      const signature = url.searchParams.get('sig');
+      const expires = expiresText && /^\d{1,16}$/.test(expiresText) ? Number(expiresText) : NaN;
+      const now = Date.now();
+      if (!Number.isSafeInteger(expires) || expires <= now || expires > now + receiptMaxAheadMs ||
+          typeof signature !== 'string' || !/^[a-f0-9]{64}$/.test(signature) ||
+          !secureEquals(signature, receiptSignature(receiptMatch[1]))) {
+        return fail(res, 403, '領収書リンクを利用できません');
+      }
+      const order = orderRecord(db, receiptMatch[1]);
+      if (!order) return fail(res, 404, '注文が見つかりません');
+      return json(res, 200, {
+        receipt: {
+          id: order.id, createdAt: order.createdAt, name: order.name, address: order.address,
+          postalCode: order.postalCode, items: order.items, total: order.total,
+        },
+      });
+    }
     if (!pathname.startsWith('/api/')) {
       if (req.method === 'GET' || req.method === 'HEAD') return serveStatic(res, pathname);
       return fail(res, 405, 'この操作はできません');
@@ -283,8 +483,19 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
         const body = await readJson(req);
         const email = textField(body.email, 160, 'メールアドレス').toLowerCase();
         const password = textField(body.password, 128, 'パスワード');
+        const key = loginKey(req, email);
+        const now = Date.now();
+        const attempts = recentLoginFailures(key, now);
+        if (attempts.length >= loginFailureLimit) {
+          res.setHeader('Retry-After', String(Math.ceil((attempts[0] + loginWindowMs - now) / 1000)));
+          return fail(res, 429, 'ログイン試行が多すぎます。時間をおいて再度お試しください');
+        }
         const candidate = db.prepare('SELECT * FROM users WHERE email=?').get(email);
-        if (!candidate || !passwordMatches(password, candidate)) return fail(res, 401, 'メールアドレスまたはパスワードが違います');
+        if (!candidate || !passwordMatches(password, candidate)) {
+          recordLoginFailure(key, attempts, now);
+          return fail(res, 401, 'メールアドレスまたはパスワードが違います');
+        }
+        failedLogins.delete(key);
         sessions.delete(sid);
         sid = randomBytes(32).toString('base64url');
         session = { userId: candidate.id, csrf: randomBytes(32).toString('base64url'), expires: Date.now() + sessionMaxAge };
@@ -321,9 +532,184 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
         const product = db.prepare('SELECT * FROM products WHERE id=? AND visible=1').get(Number(productMatch[1]));
         if (!product) return fail(res, 404, '商品が見つかりません');
         const reviews = db.prepare('SELECT r.*,u.name AS author_name FROM reviews r JOIN users u ON u.id=r.user_id WHERE r.product_id=? ORDER BY r.id DESC LIMIT 100').all(product.id).map(publicReview);
-        return json(res, 200, { product: publicProduct(product), reviews });
+        const privateData = db.prepare('SELECT supplier_cost,internal_note FROM product_private WHERE product_id=?').get(product.id);
+        // VULNERABLE: the public detail serializer includes internal supply properties.
+        return json(res, 200, {
+          product: {
+            ...publicProduct(product),
+            supply: privateData ? { supplierCost: privateData.supplier_cost, internalNote: privateData.internal_note } : null,
+          },
+          reviews,
+        });
+      }
+      if (req.method === 'GET' && pathname === '/api/integrations/catalog') {
+        const principal = bearerPrincipal(req);
+        if (!principal || principal.scope !== 'catalog:read') return fail(res, 401, 'APIトークンを確認してください');
+        const rows = db.prepare('SELECT id,name,category,price,stock FROM products WHERE visible=1 ORDER BY id LIMIT 50').all();
+        return json(res, 200, { products: rows });
+      }
+      if (req.method === 'GET' && pathname === '/api/integrations/account') {
+        const principal = bearerPrincipal(req);
+        if (!principal) return fail(res, 401, 'APIトークンを確認してください');
+        // VULNERABLE: this endpoint checks token validity and subject, but omits the catalog:read scope check.
+        return json(res, 200, { member: { name: principal.name, email: principal.email, address: principal.address } });
       }
       if (!user) return fail(res, 401, 'ログインしてください');
+
+      if (req.method === 'POST' && pathname === '/api/integrations/tokens') {
+        const body = await readJson(req);
+        if (body.scope !== undefined && body.scope !== 'catalog:read') return fail(res, 400, 'スコープを確認してください');
+        const now = Date.now();
+        db.prepare('DELETE FROM api_tokens WHERE expires_at<=?').run(now);
+        const count = db.prepare('SELECT COUNT(*) AS n FROM api_tokens WHERE user_id=?').get(user.id).n;
+        if (count >= 5) return fail(res, 409, '有効なAPIトークンの上限に達しています');
+        const token = randomBytes(32).toString('base64url');
+        const expiresAtMs = now + integrationTokenLifetimeMs;
+        db.prepare('INSERT INTO api_tokens (token_hash,user_id,scope,expires_at) VALUES (?,?,?,?)')
+          .run(tokenHash(token), user.id, 'catalog:read', expiresAtMs);
+        return json(res, 201, { token, scope: 'catalog:read', expiresAt: new Date(expiresAtMs).toISOString() });
+      }
+
+      if (req.method === 'GET' && pathname === '/api/account/widget') {
+        const origin = req.headers.origin;
+        res.setHeader('Vary', 'Origin');
+        if (trustedWidgetOrigin(origin, additionalHost)) {
+          // VULNERABLE: every port on an approved local hostname may read this private widget with credentials.
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Access-Control-Allow-Credentials', 'true');
+        }
+        const latest = db.prepare('SELECT id,status FROM orders WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 1').get(user.id);
+        return json(res, 200, {
+          member: { name: user.name, email: user.email, address: user.address },
+          latestOrder: latest ? { id: latest.id, status: latest.status } : null,
+        });
+      }
+      if (req.method === 'POST' && pathname === '/api/links/preview') {
+        const body = await readJson(req);
+        const path = textField(body.path, 120, 'プレビュー対象');
+        if (!path.startsWith('/') || path.includes('//') || path.includes('\\') ||
+            path.includes('?') || path.includes('#') || /[\u0000-\u001f\u007f]/.test(path)) {
+          return fail(res, 400, 'プレビュー対象のパスを確認してください');
+        }
+        const address = server.address();
+        if (!address || typeof address === 'string') return fail(res, 503, 'プレビューを利用できません');
+        const base = `http://127.0.0.1:${address.port}`;
+        const destination = new URL(path, base);
+        if (destination.origin !== base) return fail(res, 400, 'プレビュー対象のパスを確認してください');
+        try {
+          // VULNERABLE: the first-party URL is constrained, but its internal path is not authorized.
+          const response = await fetch(destination, {
+            method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(previewTimeoutMs),
+            headers: { Accept: 'application/json' },
+          });
+          if (!response.ok || !response.headers.get('content-type')?.toLowerCase().startsWith('application/json')) {
+            await response.body?.cancel();
+            return fail(res, 502, 'プレビューを取得できません');
+          }
+          const reader = response.body?.getReader();
+          if (!reader) return fail(res, 502, 'プレビューを取得できません');
+          let size = 0;
+          const chunks = [];
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              size += value.byteLength;
+              if (size > previewMaxBytes) {
+                await reader.cancel();
+                return fail(res, 502, 'プレビューの応答が長すぎます');
+              }
+              chunks.push(Buffer.from(value));
+            }
+          } finally {
+            reader.releaseLock();
+          }
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+              typeof parsed.title !== 'string' || typeof parsed.summary !== 'string') {
+            return fail(res, 502, 'プレビューを取得できません');
+          }
+          return json(res, 200, { preview: { title: parsed.title, summary: parsed.summary } });
+        } catch { return fail(res, 502, 'プレビューを取得できません'); }
+      }
+      if (req.method === 'GET' && pathname === '/api/account/overview') {
+        const now = Date.now();
+        const hit = overviewCache && overviewCache.expires > now;
+        if (!hit) {
+          const latest = db.prepare('SELECT id,status,name,address,postal_code FROM orders WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 1').get(user.id);
+          // VULNERABLE: this short-lived application cache has no user-specific key.
+          overviewCache = {
+            expires: now + 10 * 1000,
+            value: {
+              member: { id: user.id, name: user.name, email: user.email, address: user.address },
+              latestOrder: latest ? { id: latest.id, status: latest.status, name: latest.name, address: latest.address, postalCode: latest.postal_code } : null,
+            },
+          };
+        }
+        return json(res, 200, overviewCache.value, { 'X-Cache': hit ? 'HIT' : 'MISS' });
+      }
+      if (req.method === 'POST' && pathname === '/api/account/password-code') {
+        const code = randomBytes(32).toString('base64url');
+        const expiresAtMs = Date.now() + accountCodeLifetimeMs;
+        db.prepare('DELETE FROM password_codes WHERE expires_at<=? OR used_at IS NOT NULL').run(Date.now());
+        db.prepare('INSERT INTO password_codes (code_hash,user_id,expires_at,used_at) VALUES (?,?,?,NULL)').run(tokenHash(code), user.id, expiresAtMs);
+        // Local training delivery: no email provider or outbound connection exists.
+        return json(res, 200, { code, expiresAt: new Date(expiresAtMs).toISOString() });
+      }
+      if (req.method === 'POST' && pathname === '/api/account/password') {
+        const body = await readJson(req);
+        const email = textField(body.email, 160, 'メールアドレス').toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail(res, 400, 'メールアドレスの形式を確認してください');
+        const code = textField(body.code, 128, '確認コード');
+        const newPassword = textField(body.newPassword, 128, '新しいパスワード');
+        if (newPassword.length < 10) return fail(res, 400, 'パスワードは10文字以上にしてください');
+        const codeRow = db.prepare('SELECT user_id,expires_at,used_at FROM password_codes WHERE code_hash=?').get(tokenHash(code));
+        if (!codeRow || codeRow.user_id !== user.id || codeRow.used_at !== null || codeRow.expires_at <= Date.now()) return fail(res, 400, '確認コードを利用できません');
+        const target = db.prepare('SELECT id FROM users WHERE email=?').get(email);
+        if (!target) return fail(res, 400, '確認コードを利用できません');
+        const { salt, hash } = passwordRecord(newPassword);
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const used = db.prepare('UPDATE password_codes SET used_at=? WHERE code_hash=? AND used_at IS NULL AND expires_at>?').run(Date.now(), tokenHash(code), Date.now());
+          if (used.changes !== 1) throw Object.assign(new Error('確認コードを利用できません'), { status: 400 });
+          // VULNERABLE: the code owner is authenticated, but not bound to the target email.
+          db.prepare('UPDATE users SET password_salt=?,password_hash=? WHERE id=?').run(salt, hash, target.id);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        for (const [sessionId, active] of sessions) if (active.userId === target.id) sessions.delete(sessionId);
+        if (target.id === user.id) res.setHeader('Set-Cookie', 'kova_sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+        return json(res, 200, { ok: true });
+      }
+      if (req.method === 'GET' && pathname === '/api/rewards/summary') return json(res, 200, rewardSummary(db, user.id));
+      if (req.method === 'POST' && pathname === '/api/rewards/offer') {
+        if (rewardSummary(db, user.id).campaignRedeemed) return fail(res, 409, 'この特典は受け取り済みです');
+        const token = randomBytes(32).toString('base64url');
+        const expiresAtMs = Date.now() + rewardTokenLifetimeMs;
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare('INSERT INTO reward_balances (user_id,points,campaign_redeemed) VALUES (?,0,0) ON CONFLICT(user_id) DO NOTHING').run(user.id);
+          db.prepare('DELETE FROM reward_tokens WHERE user_id=? AND used_at IS NULL').run(user.id);
+          db.prepare('INSERT INTO reward_tokens (token_hash,user_id,points,expires_at,used_at) VALUES (?,?,?,?,NULL)').run(tokenHash(token), user.id, rewardOfferPoints, expiresAtMs);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        return json(res, 200, { token, points: rewardOfferPoints, expiresAt: new Date(expiresAtMs).toISOString() });
+      }
+      if (req.method === 'POST' && pathname === '/api/rewards/claim') {
+        const body = await readJson(req);
+        const token = textField(body.token, 128, '特典コード');
+        const hash = tokenHash(token);
+        const row = db.prepare('SELECT user_id,points,expires_at,used_at FROM reward_tokens WHERE token_hash=?').get(hash);
+        if (!row || row.user_id !== user.id || row.used_at !== null || row.expires_at <= Date.now() || rewardSummary(db, user.id).campaignRedeemed) return fail(res, 409, '特典コードを利用できません');
+        // VULNERABLE: both requests may pass the check before either one credits the balance.
+        await delay(35);
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare('UPDATE reward_balances SET points=points+?,campaign_redeemed=1 WHERE user_id=?').run(row.points, user.id);
+          db.prepare('UPDATE reward_tokens SET used_at=? WHERE token_hash=?').run(Date.now(), hash);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        return json(res, 200, { points: rewardSummary(db, user.id).points, credited: row.points });
+      }
 
       if (req.method === 'GET' && pathname === '/api/cart') return json(res, 200, cartState(db, user.id));
       if (req.method === 'POST' && pathname === '/api/cart') {
@@ -375,7 +761,7 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
         const orderId = `K-${new Date().getUTCFullYear()}-${1001 + Number(db.prepare('SELECT COUNT(*) AS n FROM orders').get().n)}`;
         db.exec('BEGIN IMMEDIATE');
         try {
-          db.prepare('INSERT INTO orders (id,user_id,status,subtotal,shipping_fee,total,created_at,name,address,postal_code,method) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(orderId, user.id, 'processing', subtotal, shippingFee, subtotal + shippingFee, new Date().toISOString(), name, address, postalCode, method);
+          db.prepare('INSERT INTO orders (id,user_id,status,subtotal,shipping_fee,total,created_at,name,address,postal_code,method,stock_reserved) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)').run(orderId, user.id, 'processing', subtotal, shippingFee, subtotal + shippingFee, new Date().toISOString(), name, address, postalCode, method);
           const put = db.prepare('INSERT INTO order_items (order_id,product_id,name,quantity,price) VALUES (?,?,?,?,?)');
           const stock = db.prepare('UPDATE products SET stock=stock-? WHERE id=? AND stock>=?');
           for (const item of items) {
@@ -387,9 +773,67 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
         } catch (error) { db.exec('ROLLBACK'); throw error; }
         return json(res, 201, { order: orderRecord(db, orderId) });
       }
+      const settleMatch = pathname.match(/^\/api\/returns\/(\d+)\/settle$/);
+      if (req.method === 'POST' && settleMatch) {
+        const returnId = Number(settleMatch[1]);
+        if (!Number.isSafeInteger(returnId)) return fail(res, 404, '返品申請が見つかりません');
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const current = db.prepare('SELECT user_id,status,credit_points FROM return_requests WHERE id=? AND user_id=?')
+            .get(returnId, user.id);
+          if (!current) throw Object.assign(new Error('返品申請が見つかりません'), { status: 404 });
+          if (current.status === 'settled') throw Object.assign(new Error('この返品申請は処理済みです'), { status: 409 });
+          // VULNERABLE: pending requests can be credited before staff approval.
+          const changed = db.prepare("UPDATE return_requests SET status='settled' WHERE id=? AND user_id=? AND status IN ('pending','approved')")
+            .run(returnId, user.id);
+          if (changed.changes !== 1) throw Object.assign(new Error('この返品申請は処理できません'), { status: 409 });
+          db.prepare('INSERT INTO reward_balances (user_id,points,campaign_redeemed) VALUES (?,0,0) ON CONFLICT(user_id) DO NOTHING')
+            .run(user.id);
+          db.prepare('UPDATE reward_balances SET points=points+? WHERE user_id=?').run(current.credit_points, user.id);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        return json(res, 200, { returnRequest: returnRequestRecord(db, returnId), points: rewardSummary(db, user.id).points });
+      }
       if (req.method === 'GET' && pathname === '/api/orders') {
         const ids = db.prepare('SELECT id FROM orders WHERE user_id=? ORDER BY created_at DESC').all(user.id);
         return json(res, 200, { orders: ids.map((row) => orderRecord(db, row.id)) });
+      }
+      const returnsMatch = pathname.match(/^\/api\/orders\/(K-\d{4}-\d+)\/returns$/);
+      if (req.method === 'POST' && returnsMatch) {
+        const id = returnsMatch[1];
+        const order = db.prepare('SELECT id,status FROM orders WHERE id=? AND user_id=?').get(id, user.id);
+        if (!order) return fail(res, 404, '注文が見つかりません');
+        if (order.status !== 'delivered') return fail(res, 409, 'この注文は返品申請できません');
+        const result = db.prepare(`INSERT OR IGNORE INTO return_requests
+          (order_id,user_id,status,credit_points,requested_at) VALUES (?,?,'pending',?,?)`)
+          .run(id, user.id, returnCreditPoints, new Date().toISOString());
+        if (result.changes !== 1) return fail(res, 409, 'この注文は返品申請済みです');
+        return json(res, 201, { returnRequest: returnRequestRecord(db, Number(result.lastInsertRowid)) });
+      }
+      const orderReturnMatch = pathname.match(/^\/api\/orders\/(K-\d{4}-\d+)\/return$/);
+      if (req.method === 'GET' && orderReturnMatch) {
+        const id = orderReturnMatch[1];
+        const owned = db.prepare('SELECT 1 FROM orders WHERE id=? AND user_id=?').get(id, user.id);
+        if (!owned) return fail(res, 404, '注文が見つかりません');
+        const request = db.prepare('SELECT * FROM return_requests WHERE order_id=? AND user_id=?').get(id, user.id);
+        return json(res, 200, { returnRequest: publicReturnRequest(request) });
+      }
+      const receiptLinkMatch = pathname.match(/^\/api\/orders\/(K-\d{4}-\d+)\/receipt-link$/);
+      if (req.method === 'POST' && receiptLinkMatch) {
+        const id = receiptLinkMatch[1];
+        const owned = db.prepare('SELECT 1 FROM orders WHERE id=? AND user_id=?').get(id, user.id);
+        if (!owned) return fail(res, 404, '注文が見つかりません');
+        const expires = Date.now() + receiptLinkLifetimeMs;
+        const signature = receiptSignature(id);
+        return json(res, 200, {
+          url: `/api/receipts/${id}?expires=${expires}&sig=${signature}`,
+          expiresAt: new Date(expires).toISOString(),
+        });
+      }
+      const cancelMatch = pathname.match(/^\/api\/orders\/(K-\d{4}-\d+)\/cancel$/);
+      if (req.method === 'GET' && cancelMatch) {
+        // VULNERABLE: a state-changing GET passes the global CSRF gate without a token.
+        return json(res, 200, { order: cancelOrder(db, cancelMatch[1], { ownerId: user.id }) });
       }
       const orderMatch = pathname.match(/^\/api\/orders\/(K-\d{4}-\d+)$/);
       if (req.method === 'GET' && orderMatch) {
@@ -409,6 +853,7 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
         };
         if (!['customer', 'staff'].includes(updated.role)) return fail(res, 400, 'プロフィールを更新できません');
         db.prepare('UPDATE users SET name=?,address=?,bio=?,role=? WHERE id=?').run(updated.name, updated.address, updated.bio, updated.role, user.id);
+        overviewCache = null;
         return json(res, 200, { profile: publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id)) });
       }
       const reviewMatch = pathname.match(/^\/api\/products\/(\d+)\/reviews$/);
@@ -433,12 +878,56 @@ export function createApplication({ dataDir = join(process.cwd(), 'data'), addit
           const ids = db.prepare('SELECT id FROM orders ORDER BY created_at DESC LIMIT 20').all();
           return json(res, 200, { stats, orders: ids.map((row) => orderRecord(db, row.id)) });
         }
+        if (req.method === 'GET' && pathname === '/api/staff/orders/export.csv') {
+          const rows = db.prepare(`SELECT id,name,postal_code,address,status,total,created_at
+            FROM orders ORDER BY created_at DESC,id DESC LIMIT 500`).all();
+          const records = [
+            ['id', 'recipient_name', 'postal_code', 'address', 'status', 'total', 'created_at'],
+            ...rows.map((row) => [row.id, row.name, row.postal_code, row.address, row.status, row.total, row.created_at]),
+          ];
+          const body = records.map((record) => record.map(csvCell).join(',')).join('\r\n') + '\r\n';
+          res.writeHead(200, {
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="kova-orders.csv"',
+            'Cache-Control': 'no-store',
+            'Content-Length': Buffer.byteLength(body),
+          });
+          return res.end(body);
+        }
+        if (req.method === 'GET' && pathname === '/api/staff/returns') {
+          const rows = db.prepare(`SELECT r.*,u.name AS customer_name FROM return_requests r
+            JOIN users u ON u.id=r.user_id ORDER BY r.requested_at DESC,r.id DESC LIMIT 100`).all();
+          return json(res, 200, {
+            returns: rows.map((row) => ({ ...publicReturnRequest(row), customerName: row.customer_name })),
+          });
+        }
+        const staffReturnMatch = pathname.match(/^\/api\/staff\/returns\/(\d+)$/);
+        if (req.method === 'PATCH' && staffReturnMatch) {
+          const returnId = Number(staffReturnMatch[1]);
+          if (!Number.isSafeInteger(returnId)) return fail(res, 404, '返品申請が見つかりません');
+          const body = await readJson(req);
+          if (body.status !== 'approved') return fail(res, 400, '返品状態を確認してください');
+          const changed = db.prepare("UPDATE return_requests SET status='approved' WHERE id=? AND status='pending'")
+            .run(returnId);
+          if (changed.changes !== 1) {
+            const exists = db.prepare('SELECT 1 FROM return_requests WHERE id=?').get(returnId);
+            return fail(res, exists ? 409 : 404, exists ? 'この返品申請は承認できません' : '返品申請が見つかりません');
+          }
+          return json(res, 200, { returnRequest: returnRequestRecord(db, returnId) });
+        }
         const staffOrder = pathname.match(/^\/api\/staff\/orders\/(K-\d{4}-\d+)$/);
         if (req.method === 'PATCH' && staffOrder) {
           const body = await readJson(req);
           if (!['processing', 'shipped', 'delivered', 'cancelled'].includes(body.status)) return fail(res, 400, '注文状態を確認してください');
-          const result = db.prepare('UPDATE orders SET status=? WHERE id=?').run(body.status, staffOrder[1]);
-          return result.changes ? json(res, 200, { order: orderRecord(db, staffOrder[1]) }) : fail(res, 404, '注文が見つかりません');
+          if (body.status === 'cancelled') return json(res, 200, { order: cancelOrder(db, staffOrder[1]) });
+          const current = db.prepare('SELECT status FROM orders WHERE id=?').get(staffOrder[1]);
+          if (!current) return fail(res, 404, '注文が見つかりません');
+          const allowed = current.status === 'processing' ? ['processing', 'shipped', 'delivered'] :
+            current.status === 'shipped' ? ['shipped', 'delivered'] :
+              current.status === 'delivered' ? ['delivered'] : [];
+          if (!allowed.includes(body.status)) return fail(res, 409, 'この注文状態には変更できません');
+          const result = db.prepare('UPDATE orders SET status=? WHERE id=? AND status=?').run(body.status, staffOrder[1], current.status);
+          return result.changes ? json(res, 200, { order: orderRecord(db, staffOrder[1]) }) : fail(res, 409, 'この注文状態には変更できません');
         }
       }
       return fail(res, 404, '操作が見つかりません');

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import {
-  ArrowLeft, ArrowRight, Check, ChevronDown, ChevronRight,
-  Instagram, LockKeyhole, Menu, Minus, Package, Plus, Search,
+  ArrowLeft, ArrowRight, Check, ChevronDown, ChevronRight, Copy, ExternalLink, FileText,
+  Gift, Instagram, KeyRound, LockKeyhole, Menu, Minus, Package, Plus, Search,
   ShoppingBag, SlidersHorizontal, Sparkles, Star, Trash2, Truck, UserRound, X,
 } from 'lucide-react'
 import ProductVisual from './ProductVisual'
@@ -14,6 +14,12 @@ type CartItem = { id: number; productId: number; quantity: number; product: Prod
 type Cart = { items: CartItem[]; subtotal: number }
 type OrderItem = { productId: number; name: string; quantity: number; price: number }
 type Order = { id: string; status: string; subtotal: number; shippingFee: number; total: number; createdAt: string; items: OrderItem[]; name: string; address: string; postalCode: string; method: string }
+type AccountOverview = { member: Pick<User, 'id' | 'name' | 'email' | 'address'>; latestOrder: Pick<Order, 'id' | 'status' | 'name' | 'address' | 'postalCode'> | null }
+type RewardOffer = { token: string; points: number; expiresAt: string }
+type ReceiptLink = { url: string; expiresAt: string }
+type LinkPreview = { title: string; summary: string }
+type IntegrationToken = { token: string; scope: string; expiresAt: string }
+type ReturnRequest = { id: number; orderId: string; status: 'pending' | 'approved' | 'settled'; creditPoints: number; requestedAt: string }
 type Route = { path: string; query: URLSearchParams }
 
 class HttpError extends Error {
@@ -127,6 +133,7 @@ function Header({ user, cartCount }: { user: User | null; cartCount: number }) {
           <Link to="/shop?category=デスク" onClick={() => setMenuOpen(false)}>デスク</Link>
           <Link to="/shop?category=照明" onClick={() => setMenuOpen(false)}>照明</Link>
           <Link to="/shop?category=キッチン" onClick={() => setMenuOpen(false)}>キッチン</Link>
+          <Link to="/rewards" onClick={() => setMenuOpen(false)}>KOVA Rewards</Link>
           {user?.role === 'staff' && <Link to="/staff" onClick={() => setMenuOpen(false)}>ストア管理</Link>}
         </nav>
         <div className="site-header__actions">
@@ -363,17 +370,187 @@ function OrdersPage({ notify }: { notify: (message: string) => void }) {
 function OrderDetail({ id, notify }: { id: string; notify: (message: string) => void }) {
   const [order, setOrder] = useState<Order | null>(null)
   const [loading, setLoading] = useState(true)
-  useEffect(() => { setLoading(true); client.request<{ order: Order }>('/api/orders/' + id).then((result) => setOrder(result.order)).catch((error) => notify(messageOf(error))).finally(() => setLoading(false)) }, [id, notify])
-  return <main className="page-shell shell narrow-page"><div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} /><Link to="/orders">注文履歴</Link><ChevronRight size={14} />注文番号 #{id}</div>{loading ? <div className="page-loading"><Spinner /></div> : order ? <><div className="order-confirmation"><div className="order-confirmation__icon"><Check size={30} /></div><p className="eyebrow">ORDER DETAILS</p><h1>ご注文の詳細</h1><p>ご注文内容と配送状況をご確認いただけます。</p></div><div className="order-detail-grid"><section className="form-panel"><h2>ご注文情報</h2><div className="detail-pair"><span>注文番号</span><strong>#{order.id}</strong></div><div className="detail-pair"><span>注文日</span><strong>{date(order.createdAt)}</strong></div><div className="detail-pair"><span>ステータス</span><strong className="status-badge">{statusText(order.status)}</strong></div><div className="detail-pair"><span>配送方法</span><strong>{order.method === 'express' ? 'お急ぎ便' : '通常配送'}</strong></div></section><section className="form-panel"><h2>お届け先</h2><p className="address-copy">{order.name}<br />〒{order.postalCode}<br />{order.address}</p></section></div><section className="form-panel order-detail-items"><h2>ご注文商品</h2>{order.items.map((item, index) => <div className="detail-pair" key={index}><span>{item.name} × {item.quantity}</span><strong>{money(item.price * item.quantity)}</strong></div>)}<div className="detail-pair"><span>小計</span><strong>{money(order.subtotal)}</strong></div><div className="detail-pair"><span>送料</span><strong>{money(order.shippingFee)}</strong></div><div className="detail-pair detail-pair--total"><span>合計</span><strong>{money(order.total)}</strong></div></section><Link to="/shop" className="button button--outline order-detail-back">お買い物を続ける <ArrowRight size={17} /></Link></> : <EmptyState icon={<Package size={30} />} title="注文が見つかりませんでした" text="注文履歴からお確かめください。" action={<Link to="/orders" className="button button--dark">注文履歴へ</Link>} />}</main>
+  const [loadError, setLoadError] = useState('')
+  const [retryKey, setRetryKey] = useState(0)
+  const [receiptLink, setReceiptLink] = useState<ReceiptLink | null>(null)
+  const [receiptBusy, setReceiptBusy] = useState(false)
+  const [receiptError, setReceiptError] = useState('')
+  const [copyMessage, setCopyMessage] = useState('')
+  const [cancelBusy, setCancelBusy] = useState(false)
+  const [cancelError, setCancelError] = useState('')
+  const [returnRequest, setReturnRequest] = useState<ReturnRequest | null>(null)
+  const [returnLoading, setReturnLoading] = useState(true)
+  const [returnBusy, setReturnBusy] = useState(false)
+  const [returnError, setReturnError] = useState('')
+  const receiptInput = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    setLoadError('')
+    setOrder(null)
+    setReceiptLink(null)
+    setReturnRequest(null)
+    setReturnLoading(true)
+    setReturnError('')
+    client.request<{ order: Order }>('/api/orders/' + encodeURIComponent(id)).then((result) => {
+      if (active) setOrder(result.order)
+    }).catch((caught) => {
+      if (active) setLoadError(messageOf(caught))
+    }).finally(() => { if (active) setLoading(false) })
+    client.request<{ returnRequest: ReturnRequest | null }>('/api/orders/' + encodeURIComponent(id) + '/return').then((result) => {
+      if (active) setReturnRequest(result.returnRequest)
+    }).catch((caught) => {
+      if (active) setReturnError(messageOf(caught))
+    }).finally(() => { if (active) setReturnLoading(false) })
+    return () => { active = false }
+  }, [id, retryKey])
+
+  const shareReceipt = async () => {
+    setReceiptBusy(true)
+    setReceiptError('')
+    setCopyMessage('')
+    try {
+      const result = await client.request<ReceiptLink>('/api/orders/' + encodeURIComponent(id) + '/receipt-link', 'POST')
+      const url = new URL(result.url, window.location.origin)
+      if (url.origin !== window.location.origin || !url.pathname.startsWith('/api/receipts/')) {
+        throw new Error('領収書リンクを確認できませんでした。')
+      }
+      setReceiptLink({ url: url.href, expiresAt: result.expiresAt })
+    } catch (caught) { setReceiptError(messageOf(caught)) }
+    finally { setReceiptBusy(false) }
+  }
+
+  const copyReceipt = async () => {
+    if (!receiptLink) return
+    try {
+      await navigator.clipboard.writeText(receiptLink.url)
+      setCopyMessage('リンクをコピーしました。')
+    } catch {
+      receiptInput.current?.focus()
+      receiptInput.current?.select()
+      setCopyMessage('リンクを選択しました。手動でコピーしてください。')
+    }
+  }
+
+  const cancelOrder = async () => {
+    if (order?.status !== 'processing') return
+    setCancelBusy(true)
+    setCancelError('')
+    try {
+      const path = '/api/orders/' + encodeURIComponent(id)
+      const result = await client.request<{ order: Order }>(path + '/cancel')
+      setOrder(result.order)
+      setReceiptLink(null)
+      notify('注文をキャンセルしました')
+      try {
+        const refreshed = await client.request<{ order: Order }>(path)
+        setOrder(refreshed.order)
+      } catch {
+        setCancelError('キャンセルは完了しました。最新の状態を表示するにはページを再読み込みしてください。')
+      }
+    } catch (caught) {
+      setCancelError(messageOf(caught))
+      client.request<{ order: Order }>('/api/orders/' + encodeURIComponent(id)).then((refreshed) => setOrder(refreshed.order)).catch(() => {})
+    } finally { setCancelBusy(false) }
+  }
+
+  const requestReturn = async () => {
+    setReturnBusy(true)
+    setReturnError('')
+    try {
+      const result = await client.request<{ returnRequest: ReturnRequest }>('/api/orders/' + encodeURIComponent(id) + '/returns', 'POST')
+      setReturnRequest(result.returnRequest)
+      notify('返品リクエストを受け付けました')
+    } catch (caught) { setReturnError(messageOf(caught)) }
+    finally { setReturnBusy(false) }
+  }
+
+  const settleReturn = async () => {
+    if (!returnRequest || returnRequest.status !== 'approved') return
+    setReturnBusy(true)
+    setReturnError('')
+    try {
+      const result = await client.request<{ returnRequest: ReturnRequest; points: number }>('/api/returns/' + encodeURIComponent(returnRequest.id) + '/settle', 'POST')
+      setReturnRequest(result.returnRequest)
+      notify('ストアクレジットを受け取りました')
+    } catch (caught) { setReturnError(messageOf(caught)) }
+    finally { setReturnBusy(false) }
+  }
+
+  return <main className="page-shell shell narrow-page">
+    <div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} /><Link to="/orders">注文履歴</Link><ChevronRight size={14} />注文番号 #{id}</div>
+    {loading ? <div className="page-loading"><Spinner /></div> : loadError ? <EmptyState icon={<Package size={30} />} title="注文を読み込めませんでした" text={loadError} action={<button type="button" className="button button--dark" onClick={() => setRetryKey((value) => value + 1)}>再読み込み <ArrowRight size={17} /></button>} /> : order ? <>
+      <div className="order-confirmation"><div className="order-confirmation__icon"><Check size={30} /></div><p className="eyebrow">ORDER DETAILS</p><h1>ご注文の詳細</h1><p>ご注文内容と配送状況をご確認いただけます。</p></div>
+      <div className="order-detail-grid">
+        <section className="form-panel"><h2>ご注文情報</h2><div className="detail-pair"><span>注文番号</span><strong>#{order.id}</strong></div><div className="detail-pair"><span>注文日</span><strong>{date(order.createdAt)}</strong></div><div className="detail-pair"><span>ステータス</span><strong className="status-badge">{statusText(order.status)}</strong></div><div className="detail-pair"><span>配送方法</span><strong>{order.method === 'express' ? 'お急ぎ便' : '通常配送'}</strong></div></section>
+        <section className="form-panel"><h2>お届け先</h2><p className="address-copy">{order.name}<br />〒{order.postalCode}<br />{order.address}</p></section>
+      </div>
+      <section className="form-panel order-detail-items"><h2>ご注文商品</h2>{order.items.map((item, index) => <div className="detail-pair" key={index}><span>{item.name} × {item.quantity}</span><strong>{money(item.price * item.quantity)}</strong></div>)}<div className="detail-pair"><span>小計</span><strong>{money(order.subtotal)}</strong></div><div className="detail-pair"><span>送料</span><strong>{money(order.shippingFee)}</strong></div><div className="detail-pair detail-pair--total"><span>合計</span><strong>{money(order.total)}</strong></div></section>
+      <section className="order-service" aria-labelledby="order-service-title">
+        <div className="order-service__heading"><p className="eyebrow">ORDER SERVICE</p><h2 id="order-service-title">ご注文のサービス</h2></div>
+        <div className="order-service__grid">
+          <div className="order-service__item"><FileText size={22} strokeWidth={1.5} /><div><h3>領収書を共有</h3><p>期限付きのリンクを発行して、ご注文内容を共有できます。</p><button type="button" className="button button--outline" onClick={shareReceipt} disabled={receiptBusy}>{receiptBusy ? '発行中...' : receiptLink ? 'リンクを再発行' : '共有リンクを発行'} <ArrowRight size={16} /></button>{receiptError && <p className="form-error" role="alert">{receiptError}</p>}{receiptLink && <div className="order-service__link"><label className="field"><span>共有リンク</span><input ref={receiptInput} readOnly value={receiptLink.url} onFocus={(event) => event.currentTarget.select()} /></label><div className="order-service__link-actions"><button type="button" onClick={copyReceipt}><Copy size={15} /> コピー</button><a href={receiptLink.url} target="_blank" rel="noopener noreferrer">開く <ExternalLink size={15} /></a></div><small>有効期限：{new Date(receiptLink.expiresAt).toLocaleString('ja-JP')}</small>{copyMessage && <p role="status">{copyMessage}</p>}</div>}</div></div>
+          {order.status === 'processing' && <div className="order-service__item"><Package size={22} strokeWidth={1.5} /><div><h3>ご注文のキャンセル</h3><p>出荷準備前のご注文はキャンセルできます。</p><button type="button" className="button button--outline" onClick={cancelOrder} disabled={cancelBusy}>{cancelBusy ? 'キャンセル中...' : '注文をキャンセル'} <ArrowRight size={16} /></button>{cancelError && <p className="form-error" role="alert">{cancelError}</p>}</div></div>}
+          {order.status === 'delivered' && <div className="order-service__item"><Package size={22} strokeWidth={1.5} /><div><h3>返品とストアクレジット</h3><p>お届け済み商品の返品リクエストを管理できます。</p>{returnLoading ? <Spinner /> : returnRequest ? <div className="order-service__return"><span className="status-badge">{returnStatusText(returnRequest.status)}</span><small>申請日：{date(returnRequest.requestedAt)} · {returnRequest.creditPoints.toLocaleString('ja-JP')} pt</small>{returnRequest.status === 'pending' && <p>確認が完了すると、ストアクレジットを受け取れます。</p>}{returnRequest.status === 'approved' && <button type="button" className="button button--outline" onClick={settleReturn} disabled={returnBusy}>{returnBusy ? '受け取り中...' : 'ストアクレジットを受け取る'} <ArrowRight size={16} /></button>}{returnRequest.status === 'settled' && <p>ストアクレジットを受け取りました。</p>}</div> : !returnError && <button type="button" className="button button--outline" onClick={requestReturn} disabled={returnBusy}>{returnBusy ? '申請中...' : '返品をリクエスト'} <ArrowRight size={16} /></button>}{returnError && <p className="form-error" role="alert">{returnError}</p>}</div></div>}
+        </div>
+        {order.status !== 'processing' && cancelError && <p className="order-service__notice" role="status">{cancelError}</p>}
+      </section>
+      <Link to="/shop" className="button button--outline order-detail-back">お買い物を続ける <ArrowRight size={17} /></Link>
+    </> : <EmptyState icon={<Package size={30} />} title="注文が見つかりませんでした" text="注文履歴からお確かめください。" action={<Link to="/orders" className="button button--dark">注文履歴へ</Link>} />}
+  </main>
+}
+
+function ProfileSidebar({ user, onLogout, active }: { user: User; onLogout: () => void; active: 'profile' | 'rewards' }) {
+  return <aside className="profile-menu">
+    <div className="profile-menu__user"><div className="avatar avatar--large">{user.name.slice(0, 1)}</div><strong>{user.name}</strong><small>{user.email}</small></div>
+    <Link to="/profile" className={active === 'profile' ? 'active' : ''}><UserRound size={18} /> プロフィール</Link>
+    <Link to="/orders"><Package size={18} /> 注文履歴</Link>
+    <Link to="/rewards" className={active === 'rewards' ? 'active' : ''}><Gift size={18} /> KOVA Rewards</Link>
+    {user.role === 'staff' && <Link to="/staff"><SlidersHorizontal size={18} /> ストア管理</Link>}
+    <button type="button" onClick={onLogout}>ログアウト <ArrowRight size={17} /></button>
+  </aside>
 }
 
 function ProfilePage({ user, onLogout, notify, onUpdated }: { user: User; onLogout: () => void; notify: (message: string) => void; onUpdated: () => Promise<unknown> }) {
   const [name, setName] = useState(user.name)
   const [address, setAddress] = useState(user.address || '')
   const [bio, setBio] = useState(user.bio || '')
+  const [overview, setOverview] = useState<AccountOverview | null>(null)
+  const [overviewLoading, setOverviewLoading] = useState(true)
+  const [overviewError, setOverviewError] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  useEffect(() => { client.request<{ profile: User }>('/api/profile').then((result) => { setName(result.profile.name); setAddress(result.profile.address || ''); setBio(result.profile.bio || '') }).catch(() => {}) }, [])
+  const [issuedCode, setIssuedCode] = useState('')
+  const [codeExpiresAt, setCodeExpiresAt] = useState('')
+  const [enteredCode, setEnteredCode] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [codeBusy, setCodeBusy] = useState(false)
+  const [passwordBusy, setPasswordBusy] = useState(false)
+  const [passwordError, setPasswordError] = useState('')
+  const [previewPath, setPreviewPath] = useState('/_media/notes')
+  const [preview, setPreview] = useState<LinkPreview | null>(null)
+  const [previewBusy, setPreviewBusy] = useState(false)
+  const [previewError, setPreviewError] = useState('')
+  const [integrationToken, setIntegrationToken] = useState<IntegrationToken | null>(null)
+  const [integrationBusy, setIntegrationBusy] = useState(false)
+  const [integrationError, setIntegrationError] = useState('')
+  const [integrationMessage, setIntegrationMessage] = useState('')
+  const integrationInput = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    let active = true
+    client.request<{ profile: User }>('/api/profile').then((result) => {
+      if (active) { setName(result.profile.name); setAddress(result.profile.address || ''); setBio(result.profile.bio || '') }
+    }).catch(() => {})
+    client.request<AccountOverview>('/api/account/overview').then((result) => {
+      if (active) setOverview(result)
+    }).catch((caught) => {
+      if (active) setOverviewError(messageOf(caught))
+    }).finally(() => { if (active) setOverviewLoading(false) })
+    return () => { active = false }
+  }, [])
+
   const save = async (event: FormEvent) => {
     event.preventDefault()
     setBusy(true)
@@ -382,21 +559,171 @@ function ProfilePage({ user, onLogout, notify, onUpdated }: { user: User; onLogo
       await client.request('/api/profile', 'PATCH', { name, address, bio })
       await onUpdated()
       notify('プロフィールを更新しました')
+      client.request<AccountOverview>('/api/account/overview').then((updated) => {
+        setOverview(updated)
+        setOverviewError('')
+      }).catch((caught) => setOverviewError(messageOf(caught)))
     } catch (caught) { setError(messageOf(caught)) }
     finally { setBusy(false) }
   }
-  return <main className="page-shell shell narrow-page"><div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} />マイページ</div><div className="page-title"><p className="eyebrow">MY ACCOUNT</p><h1>マイページ</h1></div><div className="profile-layout"><aside className="profile-menu"><div className="profile-menu__user"><div className="avatar avatar--large">{user.name.slice(0, 1)}</div><strong>{user.name}</strong><small>{user.email}</small></div><Link to="/profile" className="active"><UserRound size={18} /> プロフィール</Link><Link to="/orders"><Package size={18} /> 注文履歴</Link>{user.role === 'staff' && <Link to="/staff"><SlidersHorizontal size={18} /> ストア管理</Link>}<button type="button" onClick={onLogout}>ログアウト <ArrowRight size={17} /></button></aside><div className="profile-content"><form className="form-panel" onSubmit={save}><div className="form-panel__heading"><span>01</span><h2>基本情報</h2></div><label className="field"><span>お名前</span><input required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} /></label><label className="field"><span>メールアドレス</span><input value={user.email} disabled /></label><label className="field"><span>ご住所</span><input maxLength={200} value={address} onChange={(event) => setAddress(event.target.value)} placeholder="お届け先として利用できます" /></label><label className="field"><span>自己紹介</span><textarea rows={4} maxLength={300} value={bio} onChange={(event) => setBio(event.target.value)} placeholder="あなたについて少し教えてください" /></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="button button--dark" type="submit" disabled={busy}>{busy ? '保存中...' : '変更を保存'} <ArrowRight size={17} /></button></form></div></div></main>
+
+  const issueCode = async () => {
+    setCodeBusy(true)
+    setPasswordError('')
+    try {
+      const result = await client.request<{ code: string; expiresAt: string }>('/api/account/password-code', 'POST')
+      setIssuedCode(result.code)
+      setCodeExpiresAt(result.expiresAt)
+      setEnteredCode('')
+      notify('確認コードを発行しました')
+    } catch (caught) { setPasswordError(messageOf(caught)) }
+    finally { setCodeBusy(false) }
+  }
+
+  const changePassword = async (event: FormEvent) => {
+    event.preventDefault()
+    setPasswordBusy(true)
+    setPasswordError('')
+    try {
+      await client.request('/api/account/password', 'POST', { email: user.email, code: enteredCode, newPassword })
+      setIssuedCode('')
+      setEnteredCode('')
+      setNewPassword('')
+      await onUpdated()
+      go('/login')
+      notify('パスワードを変更しました。新しいパスワードでログインしてください')
+    } catch (caught) { setPasswordError(messageOf(caught)) }
+    finally { setPasswordBusy(false) }
+  }
+
+  const previewNotes = async (event: FormEvent) => {
+    event.preventDefault()
+    setPreviewBusy(true)
+    setPreviewError('')
+    setPreview(null)
+    try {
+      const result = await client.request<{ preview: LinkPreview }>('/api/links/preview', 'POST', { path: previewPath.trim() })
+      setPreview(result.preview)
+    } catch (caught) { setPreviewError(messageOf(caught)) }
+    finally { setPreviewBusy(false) }
+  }
+
+  const issueIntegrationToken = async () => {
+    setIntegrationBusy(true)
+    setIntegrationError('')
+    setIntegrationMessage('')
+    try {
+      const result = await client.request<IntegrationToken>('/api/integrations/tokens', 'POST')
+      setIntegrationToken(result)
+      notify('カタログ連携トークンを発行しました')
+    } catch (caught) { setIntegrationError(messageOf(caught)) }
+    finally { setIntegrationBusy(false) }
+  }
+
+  const copyIntegrationToken = async () => {
+    if (!integrationToken) return
+    try {
+      await navigator.clipboard.writeText(integrationToken.token)
+      setIntegrationMessage('トークンをコピーしました。')
+    } catch {
+      integrationInput.current?.focus()
+      integrationInput.current?.select()
+      setIntegrationMessage('トークンを選択しました。手動でコピーしてください。')
+    }
+  }
+
+  return <main className="page-shell shell narrow-page">
+    <div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} />マイページ</div>
+    <div className="page-title"><p className="eyebrow">MY ACCOUNT</p><h1>マイページ</h1><p>登録情報やご注文、特典をご確認いただけます。</p></div>
+    <div className="profile-layout"><ProfileSidebar user={user} onLogout={onLogout} active="profile" />
+      <div className="profile-content">
+        <section className="account-overview" aria-labelledby="overview-title">
+          <div className="account-overview__heading"><div><p className="eyebrow">YOUR ACCOUNT</p><h2 id="overview-title">おかえりなさい、{overview?.member.name || user.name}さん</h2></div><UserRound size={27} strokeWidth={1.3} /></div>
+          {overviewLoading ? <Spinner /> : overviewError ? <p className="account-overview__muted">{overviewError}</p> : <div className="account-overview__grid"><div><span>登録のお届け先</span><strong>{overview?.member.address || '未登録'}</strong></div><div><span>最近のご注文</span>{overview?.latestOrder ? <><strong>#{overview.latestOrder.id} · {statusText(overview.latestOrder.status)}</strong><small>{overview.latestOrder.name} 様　〒{overview.latestOrder.postalCode}<br />{overview.latestOrder.address}</small><Link to={'/orders/' + overview.latestOrder.id}>詳細を見る <ArrowRight size={14} /></Link></> : <><strong>まだご注文はありません</strong><Link to="/shop">商品を探す <ArrowRight size={14} /></Link></>}</div></div>}
+        </section>
+        <form className="form-panel" onSubmit={save}><div className="form-panel__heading"><span>01</span><h2>基本情報</h2></div><label className="field"><span>お名前</span><input required maxLength={80} autoComplete="name" value={name} onChange={(event) => setName(event.target.value)} /></label><label className="field"><span>メールアドレス</span><input value={user.email} disabled /></label><label className="field"><span>ご住所</span><input maxLength={200} autoComplete="street-address" value={address} onChange={(event) => setAddress(event.target.value)} placeholder="お届け先として利用できます" /></label><label className="field"><span>自己紹介</span><textarea rows={4} maxLength={300} value={bio} onChange={(event) => setBio(event.target.value)} placeholder="あなたについて少し教えてください" /></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="button button--dark" type="submit" disabled={busy}>{busy ? '保存中...' : '変更を保存'} <ArrowRight size={17} /></button></form>
+        <section className="form-panel account-security" aria-labelledby="security-title"><div className="form-panel__heading"><span>02</span><h2 id="security-title">パスワードの変更</h2></div><div className="account-security__intro"><KeyRound size={20} strokeWidth={1.5} /><p>確認コードを取得して、新しいパスワードを設定できます。</p></div><button className="button button--outline" type="button" onClick={issueCode} disabled={codeBusy}>{codeBusy ? '発行中...' : issuedCode ? '確認コードを再発行' : '確認コードを取得'} <ArrowRight size={16} /></button><p className="account-security__note">このデモではメール配信を行わないため、発行したコードをこの画面に表示します。</p>{issuedCode && <div className="account-security__code"><span>確認コード</span><output>{issuedCode}</output><small>{codeExpiresAt && '有効期限：' + new Date(codeExpiresAt).toLocaleString('ja-JP')}</small></div>}<form className="account-security__form" onSubmit={changePassword}><label className="field"><span>確認コード</span><input required autoComplete="one-time-code" value={enteredCode} onChange={(event) => setEnteredCode(event.target.value)} placeholder="表示されたコードを入力" /></label><label className="field"><span>新しいパスワード</span><input required type="password" minLength={10} autoComplete="new-password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="10文字以上" /></label>{passwordError && <p className="form-error" role="alert">{passwordError}</p>}<button className="button button--dark" type="submit" disabled={passwordBusy || !issuedCode}>{passwordBusy ? '変更中...' : 'パスワードを変更'} <ArrowRight size={17} /></button></form></section>
+        <section className="form-panel design-notes" aria-labelledby="design-notes-title"><div className="form-panel__heading"><span>03</span><h2 id="design-notes-title">デザインノート</h2></div><p className="design-notes__intro">KOVAの読みものを、リンクからプレビューできます。</p><form onSubmit={previewNotes}><label className="field"><span>記事のパス</span><input required maxLength={120} value={previewPath} onChange={(event) => setPreviewPath(event.target.value)} placeholder="/_media/notes" /></label><button className="button button--outline" type="submit" disabled={previewBusy}>{previewBusy ? '読み込み中...' : 'プレビューを見る'} <ArrowRight size={16} /></button></form>{previewError && <p className="form-error" role="alert">{previewError}</p>}{preview && <article className="design-notes__preview" aria-live="polite"><span>DESIGN NOTE</span><h3>{preview.title}</h3><p>{preview.summary}</p></article>}</section>
+        <section className="form-panel catalog-integration" aria-labelledby="catalog-integration-title"><div className="form-panel__heading"><span>04</span><h2 id="catalog-integration-title">商品カタログ連携</h2></div><div className="catalog-integration__intro"><KeyRound size={20} strokeWidth={1.5} /><p>商品情報を連携ツールで参照するためのトークンを発行できます。</p></div><button className="button button--outline" type="button" onClick={issueIntegrationToken} disabled={integrationBusy}>{integrationBusy ? '発行中...' : integrationToken ? '新しいトークンを発行' : 'トークンを発行'} <ArrowRight size={16} /></button>{integrationError && <p className="form-error" role="alert">{integrationError}</p>}{integrationToken && <div className="catalog-integration__token"><label className="field"><span>アクセストークン</span><input ref={integrationInput} readOnly autoComplete="off" spellCheck={false} value={integrationToken.token} onFocus={(event) => event.currentTarget.select()} /></label><button type="button" onClick={copyIntegrationToken}><Copy size={15} /> コピー</button><small>権限：{integrationToken.scope} · 有効期限：{new Date(integrationToken.expiresAt).toLocaleString('ja-JP')}</small>{integrationMessage && <p role="status">{integrationMessage}</p>}</div>}<p className="catalog-integration__note">発行したトークンは、この画面で一度だけ表示されます。</p></section>
+      </div>
+    </div>
+  </main>
+}
+
+function RewardsPage({ user, onLogout, notify }: { user: User; onLogout: () => void; notify: (message: string) => void }) {
+  const [points, setPoints] = useState<number | null>(null)
+  const [claimed, setClaimed] = useState(false)
+  const [offer, setOffer] = useState<RewardOffer | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    client.request<{ points: number; campaignRedeemed: boolean }>('/api/rewards/summary').then((result) => {
+      if (active) { setPoints(result.points); setClaimed(result.campaignRedeemed) }
+    }).catch((caught) => {
+      if (active) setError(messageOf(caught))
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [])
+
+  const handleOfferError = async (caught: unknown) => {
+    if (caught instanceof HttpError && caught.status === 409) {
+      setOffer(null)
+      try {
+        const summary = await client.request<{ points: number; campaignRedeemed: boolean }>('/api/rewards/summary')
+        setPoints(summary.points)
+        setClaimed(summary.campaignRedeemed)
+      } catch { /* Retain the original error below. */ }
+    }
+    setError(messageOf(caught))
+  }
+
+  const issueOffer = async () => {
+    setBusy(true)
+    setError('')
+    try {
+      const result = await client.request<RewardOffer>('/api/rewards/offer', 'POST')
+      setOffer(result)
+    } catch (caught) { await handleOfferError(caught) }
+    finally { setBusy(false) }
+  }
+
+  const claimOffer = async () => {
+    if (!offer) return
+    setBusy(true)
+    setError('')
+    try {
+      const result = await client.request<{ points: number; credited: number }>('/api/rewards/claim', 'POST', { token: offer.token })
+      setPoints(result.points)
+      setClaimed(true)
+      setOffer(null)
+      notify(result.credited + 'ポイントを受け取りました')
+    } catch (caught) { await handleOfferError(caught) }
+    finally { setBusy(false) }
+  }
+
+  return <main className="page-shell shell narrow-page"><div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} /><Link to="/profile">マイページ</Link><ChevronRight size={14} />KOVA Rewards</div><div className="page-title"><p className="eyebrow">KOVA REWARDS</p><h1>毎日に、ちいさな楽しみを。</h1><p>お買い物と一緒に、KOVAの特典をお楽しみください。</p></div><div className="profile-layout"><ProfileSidebar user={user} onLogout={onLogout} active="rewards" /><div className="rewards-content"><section className="rewards-balance" aria-labelledby="points-title"><div className="rewards-balance__top"><span>KOVA REWARDS</span><Gift size={29} strokeWidth={1.4} /></div><div><p id="points-title">保有ポイント</p>{loading ? <Spinner /> : <strong>{points === null ? '—' : points.toLocaleString('ja-JP')} <small>pt</small></strong>}</div><span className="rewards-balance__decoration">K.</span></section><section className="rewards-offer"><div className="rewards-offer__icon"><Sparkles size={24} strokeWidth={1.5} /></div><div><p className="eyebrow">A LITTLE GIFT FOR YOU</p><h2>会員限定のポイント特典</h2><p>日々を心地よくするアイテムを探しながら、500ポイントを受け取りましょう。</p>{offer && <p className="rewards-offer__expiry">この特典の有効期限：{new Date(offer.expiresAt).toLocaleString('ja-JP')}</p>}{error && <p className="form-error" role="alert">{error}</p>}<button type="button" className="button button--dark" disabled={busy || loading || claimed} onClick={offer ? claimOffer : issueOffer}>{busy ? '処理中...' : claimed ? '受け取り済み' : offer ? '500ポイントを受け取る' : '特典を確認する'} {!claimed && <ArrowRight size={17} />}</button></div></section><div className="rewards-fineprint"><LockKeyhole size={17} /><p>特典の確認と受け取りには、アカウントへのログインが必要です。</p></div></div></div></main>
 }
 
 function StaffPage({ notify }: { notify: (message: string) => void }) {
   const [orders, setOrders] = useState<Order[]>([])
+  const [returns, setReturns] = useState<ReturnRequest[]>([])
   const [stats, setStats] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
+  const [returnBusy, setReturnBusy] = useState<number | null>(null)
+  const [returnsError, setReturnsError] = useState('')
   const reload = useCallback(async () => {
     const result = await client.request<{ stats: Record<string, number>; orders: Order[] }>('/api/staff/overview')
     setStats(result.stats)
     setOrders(result.orders)
+    try {
+      const result = await client.request<{ returns: ReturnRequest[] }>('/api/staff/returns')
+      setReturns(result.returns)
+      setReturnsError('')
+    } catch (caught) { setReturnsError(messageOf(caught)) }
   }, [])
   useEffect(() => { reload().catch((error) => notify(messageOf(error))).finally(() => setLoading(false)) }, [reload, notify])
   const update = async (id: string, status: string) => {
@@ -405,15 +732,52 @@ function StaffPage({ notify }: { notify: (message: string) => void }) {
     catch (caught) { notify(messageOf(caught)) }
     finally { setBusy(null) }
   }
-  return <main className="page-shell shell"><div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} />ストア管理</div><div className="page-title"><p className="eyebrow">STORE OPERATIONS</p><h1>ストア管理</h1><p>注文の状況を確認・更新できます。</p></div>{loading ? <div className="page-loading"><Spinner /></div> : <><div className="staff-stats"><div><span>注文件数</span><strong>{stats.orders ?? orders.length}</strong><small>すべての注文</small></div><div><span>売上合計</span><strong>{money(stats.revenue ?? 0)}</strong><small>累計売上</small></div><div><span>発送待ち</span><strong>{stats.processing ?? orders.filter((order) => order.status === 'processing').length}</strong><small>対応が必要な注文</small></div></div><div className="staff-table"><div className="staff-table__head"><span>注文</span><span>お客様</span><span>合計</span><span>ステータス</span></div>{orders.map((order) => <div className="staff-table__row" key={order.id}><div><strong>#{order.id}</strong><small>{date(order.createdAt)}</small></div><div>{order.name}</div><div>{money(order.total)}</div><div><label className="select-wrap"><span className="sr-only">注文 #{order.id} のステータス</span><select value={order.status} disabled={busy === order.id} onChange={(event) => update(order.id, event.target.value)}><option value="processing">処理中</option><option value="shipped">発送済み</option><option value="delivered">配達済み</option><option value="cancelled">キャンセル</option></select><ChevronDown size={15} /></label></div></div>)}</div>{!orders.length && <EmptyState icon={<Package size={30} />} title="注文はありません" text="新しい注文が入るとここに表示されます。" />}</>}</main>
+  const approveReturn = async (id: number) => {
+    setReturnBusy(id)
+    try {
+      await client.request('/api/staff/returns/' + encodeURIComponent(id), 'PATCH', { status: 'approved' })
+      await reload()
+      notify('返品リクエストを承認しました')
+    } catch (caught) { notify(messageOf(caught)) }
+    finally { setReturnBusy(null) }
+  }
+  return <main className="page-shell shell">
+    <div className="breadcrumbs"><Link to="/">ホーム</Link><ChevronRight size={14} />ストア管理</div>
+    <div className="page-title"><p className="eyebrow">STORE OPERATIONS</p><h1>ストア管理</h1><p>注文と返品リクエストの状況を確認・更新できます。</p></div>
+    {loading ? <div className="page-loading"><Spinner /></div> : <>
+      <div className="staff-stats"><div><span>注文件数</span><strong>{stats.orders ?? orders.length}</strong><small>すべての注文</small></div><div><span>売上合計</span><strong>{money(stats.revenue ?? 0)}</strong><small>累計売上</small></div><div><span>発送待ち</span><strong>{stats.processing ?? orders.filter((order) => order.status === 'processing').length}</strong><small>対応が必要な注文</small></div></div>
+      <section className="staff-section" aria-labelledby="staff-orders-title">
+        <div className="staff-section__heading"><div><p className="eyebrow">ORDERS</p><h2 id="staff-orders-title">注文一覧</h2></div><a className="button button--outline" href="/api/staff/orders/export.csv" download><FileText size={16} /> CSVをダウンロード</a></div>
+        <div className="staff-table">
+          <div className="staff-table__head"><span>注文</span><span>お客様</span><span>合計</span><span>ステータス</span></div>
+          {orders.map((order) => <div className="staff-table__row" key={order.id}>
+            <div><strong>#{order.id}</strong><small>{date(order.createdAt)}</small></div>
+            <div>{order.name}</div>
+            <div>{money(order.total)}</div>
+            <div><label className="select-wrap"><span className="sr-only">注文 #{order.id} のステータス</span><select value={order.status} disabled={busy === order.id || (order.status !== 'processing' && order.status !== 'shipped')} onChange={(event) => update(order.id, event.target.value)}>
+              <option value={order.status}>{statusText(order.status)}</option>
+              {order.status === 'processing' && <><option value="shipped">発送済み</option><option value="cancelled">キャンセル</option></>}
+              {order.status === 'shipped' && <option value="delivered">配達済み</option>}
+            </select><ChevronDown size={15} /></label></div>
+          </div>)}
+        </div>
+        {!orders.length && <EmptyState icon={<Package size={30} />} title="注文はありません" text="新しい注文が入るとここに表示されます。" />}
+      </section>
+      <section className="staff-section staff-returns" aria-labelledby="staff-returns-title"><div className="staff-section__heading"><div><p className="eyebrow">RETURNS</p><h2 id="staff-returns-title">返品リクエスト</h2></div></div>{returnsError ? <p className="form-error" role="alert">{returnsError}</p> : returns.length ? <div className="staff-returns__list">{returns.map((request) => <div className="staff-returns__row" key={request.id}><div><strong>注文 #{request.orderId}</strong><small>申請日：{date(request.requestedAt)}</small></div><div><span>ストアクレジット</span><strong>{request.creditPoints.toLocaleString('ja-JP')} pt</strong></div><span className="status-badge">{returnStatusText(request.status)}</span>{request.status === 'pending' ? <button type="button" className="button button--outline" disabled={returnBusy === request.id} onClick={() => approveReturn(request.id)}>{returnBusy === request.id ? '承認中...' : '承認する'} <ArrowRight size={15} /></button> : <span className="staff-returns__done">{request.status === 'settled' ? '受け取り済み' : '承認済み'}</span>}</div>)}</div> : <p className="staff-returns__empty">新しい返品リクエストはありません。</p>}</section>
+    </>}
+  </main>
 }
 
 function Footer() {
-  return <footer className="site-footer"><div className="shell"><div className="site-footer__top"><div><Link to="/" className="wordmark">KOVA<span>.</span></Link><p>小さな変化で、暮らしはもっと心地よく。<br />毎日に寄り添う道具をお届けします。</p></div><div><span>EXPLORE</span><Link to="/shop">すべての商品</Link><Link to="/shop?category=デスク">デスク</Link><Link to="/shop?category=照明">照明</Link></div><div><span>ACCOUNT</span><Link to="/profile">マイページ</Link><Link to="/orders">注文履歴</Link><Link to="/cart">ショッピングバッグ</Link></div><div className="site-footer__letter"><span>THE KOVA EDIT</span><strong>日常の、いいもの。</strong><p>自分らしい空間づくりのヒントを、商品から見つけてください。</p><Link to="/shop" className="text-link">商品を見る <ArrowRight size={17} /></Link></div></div><div className="site-footer__bottom"><span>© 2026 KOVA. All rights reserved.</span><span>Made for the moments that matter.</span><Instagram size={17} strokeWidth={1.5} /></div></div></footer>
+  return <footer className="site-footer"><div className="shell"><div className="site-footer__top"><div><Link to="/" className="wordmark">KOVA<span>.</span></Link><p>小さな変化で、暮らしはもっと心地よく。<br />毎日に寄り添う道具をお届けします。</p></div><div><span>EXPLORE</span><Link to="/shop">すべての商品</Link><Link to="/shop?category=デスク">デスク</Link><Link to="/shop?category=照明">照明</Link></div><div><span>ACCOUNT</span><Link to="/profile">マイページ</Link><Link to="/orders">注文履歴</Link><Link to="/rewards">KOVA Rewards</Link><Link to="/cart">ショッピングバッグ</Link></div><div className="site-footer__letter"><span>THE KOVA EDIT</span><strong>日常の、いいもの。</strong><p>自分らしい空間づくりのヒントを、商品から見つけてください。</p><Link to="/shop" className="text-link">商品を見る <ArrowRight size={17} /></Link></div></div><div className="site-footer__bottom"><span>© 2026 KOVA. All rights reserved.</span><span>Made for the moments that matter.</span><Instagram size={17} strokeWidth={1.5} /></div></div></footer>
 }
 
 function statusText(status: string) {
   return ({ processing: '処理中', shipped: '発送済み', delivered: '配達済み', cancelled: 'キャンセル' } as Record<string, string>)[status] || status
+}
+
+function returnStatusText(status: ReturnRequest['status']) {
+  return ({ pending: '確認待ち', approved: '承認済み', settled: '受け取り済み' } as Record<ReturnRequest['status'], string>)[status]
 }
 
 function messageOf(error: unknown) {
@@ -510,6 +874,7 @@ export default function App() {
     if (route.path === '/checkout') return <CheckoutPage cart={cart} user={user} notify={notify} refreshCart={refreshCart} />
     if (route.path === '/login' || route.path === '/register') return <AuthPage key={route.path} mode={route.path === '/login' ? 'login' : 'register'} onSuccess={authSuccess} notify={notify} />
     if (route.path === '/profile') return user ? <ProfilePage user={user} onLogout={logout} notify={notify} onUpdated={refreshSession} /> : <AuthPrompt />
+    if (route.path === '/rewards') return user ? <RewardsPage user={user} onLogout={logout} notify={notify} /> : <AuthPrompt />
     if (route.path === '/orders') return user ? <OrdersPage notify={notify} /> : <AuthPrompt />
     if (orderMatch) return user ? <OrderDetail key={orderMatch[1]} id={orderMatch[1]} notify={notify} /> : <AuthPrompt />
     if (route.path === '/staff') return user?.role === 'staff' ? <StaffPage notify={notify} /> : <EmptyState icon={<LockKeyhole size={30} />} title="ページを表示できません" text="このページへのアクセス権がありません。" action={<Link to="/" className="button button--dark">トップへ戻る</Link>} />
